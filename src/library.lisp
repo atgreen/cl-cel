@@ -437,6 +437,51 @@ host's time zone database, as Go's time.LoadLocation does."
   (cel-replace-limited text old new -1))
 (define-cel-function "replace" (:string :string :string :int) :string (text old new limit)
   (cel-replace-limited text old new limit))
+
+;;; JSON patch keys
+
+(define-cel-function "jsonpatch.escapeKey" (nil :string) :string (key)
+  (cel-replace-limited (cel-replace-limited key "~" "~0" -1) "/" "~1" -1))
+
+;;; Authorizer: the check itself comes from *CEL-AUTHORIZER-CHECK*, bound by admission.
+
+(defun cel-authorizer-step (kind state key value)
+  "Return a copy of a builder object with KEY set."
+  (cel-opaque kind (list* key value state)))
+
+(macrolet ((builder (name from to key)
+             `(define-cel-function ,name ((:opaque ,from) :string) (cel-opaque-type ,to) (object value)
+                (cel-authorizer-step ,to (cel-opaque-value object) ,key value))))
+  (builder "group" :authorizer :group-check :group)
+  (builder "path" :authorizer :path-check :path)
+  (builder "resource" :group-check :resource-check :resource)
+  (builder "subresource" :resource-check :resource-check :subresource)
+  (builder "namespace" :resource-check :resource-check :namespace)
+  (builder "name" :resource-check :resource-check :name))
+
+(define-cel-function "serviceAccount" ((:opaque :authorizer) :string :string) (cel-opaque-type :authorizer) (object namespace name)
+  (cel-opaque :authorizer
+              (list* :user (format nil "system:serviceaccount:~A:~A" namespace name)
+                     :groups (list "system:serviceaccounts" (format nil "system:serviceaccounts:~A" namespace)
+                                   "system:authenticated")
+                     (cel-opaque-value object))))
+
+(flet ((check (object verb)
+         (unless *cel-authorizer-check* (cel-fail "the authorizer is not available in this expression"))
+         (multiple-value-bind (allowed reason problem)
+             (funcall *cel-authorizer-check* (cel-opaque-value object) verb)
+           (cel-opaque :decision (list allowed (or reason "") problem)))))
+  (dolist (kind '(:path-check :resource-check))
+    (setf (gethash "check" *cel-functions*)
+          (append (gethash "check" *cel-functions*)
+                  (list (make-cel-overload :receiver (list :opaque kind) :parameters '(:string)
+                                           :result (cel-opaque-type :decision) :function #'check))))))
+
+(define-cel-function "allowed" ((:opaque :decision)) :bool (decision) (and (first (cel-opaque-value decision)) t))
+(define-cel-function "reason" ((:opaque :decision)) :string (decision) (second (cel-opaque-value decision)))
+(define-cel-function "errored" ((:opaque :decision)) :bool (decision) (and (third (cel-opaque-value decision)) t))
+(define-cel-function "error" ((:opaque :decision)) :string (decision) (or (third (cel-opaque-value decision)) ""))
+
 (define-cel-function "charAt" (:string :int) :string (text index)
   (cond ((= index (length text)) "")
         ((< -1 index (length text)) (string (char text index)))
@@ -995,12 +1040,48 @@ host's time zone database, as Go's time.LoadLocation does."
 ;;; Common string formats
 
 (defparameter +cel-named-formats+
-  '("uri" "uuid" "byte" "date" "datetime")
-  "Portable string formats exposed by format.named and format.x().")
+  '("dns1123Label" "dns1123Subdomain" "dns1035Label" "qualifiedName"
+    "dns1123LabelPrefix" "dns1123SubdomainPrefix" "dns1035LabelPrefix"
+    "labelValue" "uri" "uuid" "byte" "date" "datetime")
+  "String formats exposed by format.named and format.x(), including the
+Kubernetes name/label validators.")
+
+(defun cel-qualified-name-valid-p (text)
+  "Return true when TEXT is a Kubernetes qualified name: an optional DNS-1123
+subdomain prefix, a '/', and a name part of alphanumerics, '-', '_' or '.'."
+  (flet ((name-part-p (part)
+           (and (<= 1 (length part) 63)
+                (cl-ppcre:scan "^[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$" part) t)))
+    (let ((slash (position #\/ text)))
+      (if slash
+          (and (name-part-p (subseq text (1+ slash)))
+               (cel-format-valid-p "dns1123Subdomain" (subseq text 0 slash)))
+          (name-part-p text)))))
 
 (defun cel-format-valid-p (format text)
   "Return true when TEXT satisfies FORMAT."
   (cond
+    ((equal format "dns1123Label")
+     (and (<= 1 (length text) 63)
+          (cl-ppcre:scan "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" text) t))
+    ((equal format "dns1123Subdomain")
+     (and (<= 1 (length text) 253)
+          (cl-ppcre:scan "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$" text) t))
+    ((equal format "dns1035Label")
+     (and (<= 1 (length text) 63)
+          (cl-ppcre:scan "^[a-z]([-a-z0-9]*[a-z0-9])?$" text) t))
+    ((equal format "qualifiedName")
+     (cel-qualified-name-valid-p text))
+    ((equal format "dns1123LabelPrefix")
+     (cel-format-valid-p "dns1123Label" (string-right-trim "-" text)))
+    ((equal format "dns1123SubdomainPrefix")
+     (cel-format-valid-p "dns1123Subdomain" (string-right-trim "-" text)))
+    ((equal format "dns1035LabelPrefix")
+     (cel-format-valid-p "dns1035Label" (string-right-trim "-" text)))
+    ((equal format "labelValue")
+     (and (<= (length text) 63)
+          (or (zerop (length text))
+              (and (cl-ppcre:scan "^[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$" text) t))))
     ((equal format "uri")
      (and (plusp (length text)) (not (find #\Space text))
           (or (char= #\/ (char text 0))
