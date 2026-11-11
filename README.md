@@ -1,9 +1,11 @@
 # cl-cel
 
-`cl-cel` is a bounded Common Expression Language compiler and evaluator for
-Common Lisp. It compiles expressions once, checks declared variables and
-function overloads, and evaluates them against caller-owned bindings with a
-deterministic cost limit.
+`cl-cel` is a bounded [Common Expression Language](https://cel.dev/) compiler
+and evaluator for Common Lisp. It compiles expressions once, checks declared
+variables and function overloads, and evaluates them against caller-owned
+bindings with a deterministic cost limit.
+
+CEL is the expression language defined by the [CEL specification](https://github.com/google/cel-spec/blob/master/doc/langdef.md).
 
 The built-in library includes conversions, strings, regular expressions,
 lists, sets, optionals, timestamps, durations, named time zones, quantities,
